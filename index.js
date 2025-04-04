@@ -1,6 +1,10 @@
 require('dotenv').config();
 const express = require('express');
 const { FacebookAdsApi, AdAccount, Campaign } = require('facebook-nodejs-business-sdk');
+const { EventEmitter } = require('events');
+
+// Create event emitter for SSE
+const mcpEmitter = new EventEmitter();
 
 // Load configuration from environment variables
 const config = {
@@ -58,10 +62,47 @@ app.get('/health', (req, res) => {
   res.json({ status: 'ok', message: 'MCP Facebook server is running' });
 });
 
-// MCP endpoint
-app.post('/v1/tools', async (req, res) => {
+// SSE endpoint for MCP
+app.get('/v1/tools', (req, res) => {
+  console.log('SSE connection established');
+  
+  // Set headers for SSE
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  
+  // Send initial connection message
+  res.write('data: {"type":"connection_ack","status":"success"}\n\n');
+  
+  // Keep the connection alive with a heartbeat
+  const heartbeatInterval = setInterval(() => {
+    res.write('data: {"type":"heartbeat"}\n\n');
+  }, 30000); // Send heartbeat every 30 seconds
+  
+  // Function to handle MCP events
+  const handleMcpEvent = (data) => {
+    console.log('Sending SSE event:', JSON.stringify(data));
+    res.write(`data: ${JSON.stringify(data)}\n\n`);
+  };
+  
+  // Listen for MCP events
+  mcpEmitter.on('mcp-event', handleMcpEvent);
+  
+  // Handle client disconnect
+  req.on('close', () => {
+    console.log('SSE connection closed');
+    clearInterval(heartbeatInterval);
+    mcpEmitter.removeListener('mcp-event', handleMcpEvent);
+  });
+});
+
+// Tool execution endpoint
+app.post('/v1/tools/execute', async (req, res) => {
   try {
-    const { name, params } = req.body;
+    const { name, params, request_id } = req.body;
+    
+    console.log(`Executing tool: ${name} with params:`, params);
     
     let result;
     
@@ -88,24 +129,57 @@ app.post('/v1/tools', async (req, res) => {
         result = await getAccountInsights(params);
         break;
       default:
-        return res.status(400).json({ 
-          error: { 
+        const errorResponse = {
+          type: "tool_execution_result",
+          request_id: request_id || "unknown",
+          status: "error",
+          error: {
             message: `Unknown tool: ${name}`,
             code: 'UNKNOWN_TOOL'
-          } 
-        });
+          }
+        };
+        
+        mcpEmitter.emit('mcp-event', errorResponse);
+        return res.status(400).json(errorResponse);
     }
     
-    res.json({ result });
+    const successResponse = {
+      type: "tool_execution_result",
+      request_id: request_id || "unknown",
+      status: "success",
+      result
+    };
+    
+    // Emit the result as an SSE event
+    mcpEmitter.emit('mcp-event', successResponse);
+    
+    // Also return as JSON for direct API calls
+    res.json(successResponse);
   } catch (error) {
-    console.error('Error handling MCP request:', error);
-    res.status(500).json({
+    console.error('Error executing tool:', error);
+    
+    const errorResponse = {
+      type: "tool_execution_result",
+      request_id: req.body.request_id || "unknown",
+      status: "error",
       error: {
         message: error.message || 'Internal server error',
         code: error.code || 'INTERNAL_ERROR'
       }
-    });
+    };
+    
+    // Emit error as an SSE event
+    mcpEmitter.emit('mcp-event', errorResponse);
+    
+    res.status(500).json(errorResponse);
   }
+});
+
+// Legacy endpoint for backward compatibility
+app.post('/v1/tools', async (req, res) => {
+  // Forward to the new endpoint
+  req.url = '/v1/tools/execute';
+  app._router.handle(req, res);
 });
 
 // Tool implementations
@@ -313,4 +387,5 @@ const PORT = config.port;
 app.listen(PORT, () => {
   console.log(`MCP Facebook server running on port ${PORT}`);
   console.log(`Health check: http://localhost:${PORT}/health`);
+  console.log(`SSE endpoint: http://localhost:${PORT}/v1/tools`);
 });
